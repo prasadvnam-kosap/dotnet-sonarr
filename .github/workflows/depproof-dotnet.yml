@@ -1,0 +1,95 @@
+# depproof .NET accuracy — added by depproof-research/dotnet-validation/fork-dotnet.sh.
+#
+# Compares the depproof Scanner's .NET results with .NET's own (`dotnet list package`), project by
+# project, on the depproof-pinned branch, so every run measures the same commit. Settings for this
+# repository are in .github/depproof/dotnet.env beside the comparison script.
+#
+# The Scanner image is an input with no default: the released image has no .NET support, so a run
+# needs a pre-release image that does.
+name: depproof .NET accuracy
+
+on:
+  workflow_dispatch:
+    inputs:
+      scanner_image:
+        description: Scanner image with .NET support, e.g. ghcr.io/depproof/depproof:v0.1.26-rc.1
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  accuracy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Never interpolated into a script directly: an input is text a person typed.
+      IMAGE: ${{ inputs.scanner_image }}
+    steps:
+      - name: Check out the pinned commit
+        uses: actions/checkout@v4
+        with:
+          ref: depproof-pinned
+          path: repo
+
+      - name: Check out this workflow's own files
+        uses: actions/checkout@v4
+        with:
+          path: tools
+          sparse-checkout: .github/depproof
+
+      - name: Read this repository's settings
+        run: cat tools/.github/depproof/dotnet.env >> "$GITHUB_ENV"
+
+      - name: Install the SDK the repository pins
+        if: env.MODE == 'restore'
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: repo/global.json
+
+      - name: Restore, and record .NET's own answer
+        if: env.MODE == 'restore'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          target="${SOLUTION:-}"
+          if [ -z "$target" ]; then
+            # No solution named: every project except the excluded ones (e.g. MAUI apps, which need a
+            # workload a Linux runner does not carry).
+            dotnet new sln -n depproof-oracle >/dev/null
+            target=$(find . -maxdepth 1 -name 'depproof-oracle.sln*' | head -1)
+            find . -name '*.csproj' | grep -v -E "${EXCLUDE:-^$}" | xargs dotnet sln "$target" add >/dev/null
+          fi
+          echo "restoring $target"
+          dotnet restore "$target"
+          mkdir -p ../out
+          # `dotnet list` exits 1 when any project has a problem (Sonarr's Windows-only project cannot
+          # restore on Linux) yet still writes every other project's answer, so that is a warning.
+          dotnet list "$target" package --include-transitive --format json > ../out/list.json \
+            || echo "::warning::dotnet list reported a problem for at least one project; see list.json"
+          dotnet list "$target" package --vulnerable --include-transitive --format json > ../out/vuln.json \
+            || echo "::warning::dotnet list --vulnerable reported a problem; see vuln.json"
+
+      - name: Scan with depproof
+        run: |
+          mkdir -p out/scan
+          docker run --rm -v "$PWD/repo:/workspace" -v "$PWD/out:/out" "$IMAGE" \
+            scan --discover --root /workspace --output-dir /out/scan --markdown --fail-on none
+
+      - name: Compare with .NET's answer
+        if: env.MODE == 'restore'
+        run: |
+          python3 tools/.github/depproof/compare.py \
+            --list out/list.json --vuln out/vuln.json --scan out/scan --root "$PWD/repo" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Scan summary (repositories .NET cannot list on Linux)
+        if: env.MODE == 'scan-only'
+        run: cat out/scan/depproof-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-accuracy
+          path: out/
